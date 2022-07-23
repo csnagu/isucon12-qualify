@@ -385,7 +385,7 @@ async function retrieveTenantRowFromHeader(req: Request): Promise<TenantRow | un
 // 参加者を取得する
 async function retrievePlayer(tenantDB: Database, id: string): Promise<PlayerRow | undefined> {
   try {
-    const playerRow = await tenantDB.get<PlayerRow>('SELECT * FROM player WHERE id = ?', id)
+    const playerRow = await tenantDB.get<PlayerRow>('SELECT id,display_name,is_disqualified FROM player WHERE id = ?', id)
     return playerRow
   } catch (error) {
     throw new Error(`error Select player: id=${id}, ${error}`)
@@ -412,7 +412,7 @@ async function authorizePlayer(tenantDB: Database, id: string): Promise<Error | 
 // 大会を取得する
 async function retrieveCompetition(tenantDB: Database, id: string): Promise<CompetitionRow | undefined> {
   try {
-    const competitionRow = await tenantDB.get<CompetitionRow>('SELECT * FROM competition WHERE id = ?', id)
+    const competitionRow = await tenantDB.get<CompetitionRow>('SELECT * FROM competition WHERE id = ? LIMIT 1', id)
     return competitionRow
   } catch (error) {
     throw new Error(`error Select competition: id=${id}, ${error}`)
@@ -657,7 +657,7 @@ app.get(
         const tenantDB = await connectToTenantDB(tenant.id)
         try {
           const competitions = await tenantDB.all<CompetitionRow[]>(
-            'SELECT * FROM competition WHERE tenant_id = ?',
+            'SELECT id FROM competition WHERE tenant_id = ?',
             tenant.id
           )
 
@@ -708,7 +708,7 @@ app.get(
       const tenantDB = await connectToTenantDB(viewer.tenantId)
       try {
         const pls = await tenantDB.all<PlayerRow[]>(
-          'SELECT * FROM player WHERE tenant_id = ? ORDER BY created_at DESC',
+          'SELECT id,display_name,is_disqualified FROM player WHERE tenant_id = ? ORDER BY created_at DESC',
           viewer.tenantId
         )
 
@@ -1129,7 +1129,7 @@ app.get(
       const tenantDB = await connectToTenantDB(viewer.tenantId)
       try {
         const competitions = await tenantDB.all<CompetitionRow[]>(
-          'SELECT * FROM competition WHERE tenant_id=? ORDER BY created_at DESC',
+          'SELECT id FROM competition WHERE tenant_id=? ORDER BY created_at DESC',
           viewer.tenantId
         )
 
@@ -1160,7 +1160,7 @@ app.get(
 async function competitionsHandler(req: Request, res: Response, viewer: Viewer, tenantDB: Database) {
   try {
     const competitions = await tenantDB.all<CompetitionRow[]>(
-      'SELECT * FROM competition WHERE tenant_id = ? ORDER BY created_at DESC',
+      'SELECT id,title,finished_at FROM competition WHERE tenant_id = ? ORDER BY created_at DESC',
       viewer.tenantId
     )
 
@@ -1258,7 +1258,8 @@ app.get(
           for (const comp of competitions) {
             const ps = await tenantDB.get<PlayerScoreRow>(
               // 最後にCSVに登場したスコアを採用する = row_numが一番大きいもの
-              'SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1',
+              // 'SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1',
+              'SELECT score, competition_id FROM player_score WHERE tenant_id = ? AND competition_id = ? AND player_id = ? ORDER BY row_num DESC LIMIT 1',
               viewer.tenantId,
               comp.id,
               p.id
@@ -1342,7 +1343,7 @@ app.get(
         }
 
         const now = Math.floor(new Date().getTime() / 1000)
-        const [[tenant]] = await adminDB.query<(TenantRow & RowDataPacket)[]>('SELECT * FROM tenant WHERE id = ?', [
+        const [[tenant]] = await adminDB.query<(TenantRow & RowDataPacket)[]>('SELECT id FROM tenant WHERE id = ?', [
           viewer.tenantId,
         ])
 
@@ -1361,13 +1362,14 @@ app.get(
         const unlock = await flockByTenantID(tenant.id)
         try {
           const pss = await tenantDB.all<PlayerScoreRow[]>(
-            'SELECT * FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC',
+            'SELECT player_id,score,row_num FROM player_score WHERE tenant_id = ? AND competition_id = ? ORDER BY row_num DESC',
             tenant.id,
             competition.id
           )
 
           const scoredPlayerSet: { [player_id: string]: number } = {}
           const tmpRanks: (CompetitionRank & WithRowNum)[] = []
+          const jobs:any[] = []
           for (const ps of pss) {
             // player_scoreが同一player_id内ではrow_numの降順でソートされているので
             // 現れたのが2回目以降のplayer_idはより大きいrow_numでスコアが出ているとみなせる
@@ -1375,20 +1377,24 @@ app.get(
               continue
             }
             scoredPlayerSet[ps.player_id] = 1
-            const p = await retrievePlayer(tenantDB, ps.player_id)
-            if (!p) {
-              throw new Error('error retrievePlayer')
+            const exeJob = async (pscore:any, prownum:any) => {
+              const p = await retrievePlayer(tenantDB, ps.player_id)
+              if (!p) {
+                throw new Error('error retrievePlayer')
+              }
+
+              tmpRanks.push({
+                rank: 0,
+                score: pscore,
+                player_id: p.id,
+                player_display_name: p.display_name,
+                row_num: prownum,
+              })
             }
-
-            tmpRanks.push({
-              rank: 0,
-              score: ps.score,
-              player_id: p.id,
-              player_display_name: p.display_name,
-              row_num: ps.row_num,
-            })
+            jobs.push(exeJob(ps.score, ps.row_num))
           }
-
+          await Promise.all(jobs)
+          // unlock()
           tmpRanks.sort((a, b) => {
             if (a.score === b.score) {
               return a.row_num < b.row_num ? -1 : 1
